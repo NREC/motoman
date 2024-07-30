@@ -61,6 +61,7 @@ namespace
 {
   const double pos_stale_time_ = 1.0;  // max time since last "current position" update, for validation (sec)
   const double start_pos_tol_  = 1e-4;  // max difference btwn start & current position, for validation (rad)
+  const double start_pos_close_  = 0.02;  // max difference btwn start & current position, for validation (rad).
 }
 
 #define ROS_ERROR_RETURN(rtn, ...) do {ROS_ERROR(__VA_ARGS__); return(rtn);} while (0)  // NOLINT(whitespace/braces)
@@ -491,6 +492,7 @@ void MotomanJointTrajectoryStreamer::streamingThread()
       {
         ROS_INFO("Trajectory streaming complete, setting state to IDLE");
         this->state_ = TransferStates::IDLE;
+        sendMotionReplyResult(pub_motion_reply_, MotionReplyResults::SUCCESS);
         break;
       }
 
@@ -548,6 +550,8 @@ void MotomanJointTrajectoryStreamer::streamingThread()
                            << " (#" << this->current_point_ << "): "
                            << MotomanMotionCtrl::getErrorString(reply_status.reply_));
           this->state_ = TransferStates::IDLE;
+          // TODO Determine if the reply should be published into pub_motion_replies_ or pub_motion_reply_.
+          sendMotionReplyResult(pub_motion_reply_, reply_status.reply_.getResult());
           break;
         }
       }
@@ -555,6 +559,8 @@ void MotomanJointTrajectoryStreamer::streamingThread()
     default:
       ROS_ERROR("Joint trajectory streamer: unknown state");
       this->state_ = TransferStates::IDLE;
+      // TODO: What MotionReplyResults should this be?
+      sendMotionReplyResult(pub_motion_reply_, MotionReplyResults::FAILURE);
       break;
     }
     // this does not unlock smpl_msg_conx_mutex_, but the mutex from JointTrajectoryStreamer
@@ -593,11 +599,24 @@ bool MotomanJointTrajectoryStreamer::is_valid(const trajectory_msgs::JointTrajec
 
   // FS100 requires trajectory start at current position
   namespace IRC_utils = industrial_robot_client::utils;
+
+  replace_start_state_ = false;
+  // Check if within tolerance. If it is, nothing to do.
   if (!IRC_utils::isWithinRange(cur_joint_pos_.name, cur_joint_pos_.position,
                                 traj.joint_names, traj.points[0].positions,
                                 start_pos_tol_))
   {
-    ROS_ERROR_RETURN(false, "Validation failed: Trajectory doesn't start at current position.");
+    // Set a replace with latest joint state if close but not within range of start_pos_tol_.
+    if (!IRC_utils::isWithinRange(cur_joint_pos_.name, cur_joint_pos_.position,
+                                  traj.joint_names, traj.points[0].positions,
+                                  start_pos_close_))
+    {
+      ROS_ERROR_RETURN(false, "Validation failed: Trajectory doesn't start at current position.");
+    } else
+    {
+      ROS_INFO("The start of the trajectory is not within tolerance, but close enough to be replaced.");
+      replace_start_state_ = true;
+    }
   }
   return true;
 }

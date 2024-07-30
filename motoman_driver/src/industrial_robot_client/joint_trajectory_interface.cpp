@@ -33,14 +33,18 @@
 #include "motoman_driver/industrial_robot_client/joint_trajectory_interface.h"
 #include "motoman_driver/industrial_robot_client/motoman_utils.h"
 #include "simple_message/joint_traj_pt.h"
+#include "motoman_driver/simple_message/motoman_motion_reply.h"
 #include "industrial_utils/param_utils.h"
+
 #include <vector>
 #include <map>
 #include <string>
+#include <thread>
 
 using industrial_utils::param::getJointNames;
 using industrial_robot_client::motoman_utils::getJointGroups;
 using industrial::simple_message::SimpleMessage;
+using motoman::simple_message::motion_reply::MotionReplyResult;
 namespace SpecialSeqValues = industrial::joint_traj_pt::SpecialSeqValues;
 typedef industrial::joint_traj_pt::JointTrajPt rbt_JointTrajPt;
 typedef trajectory_msgs::JointTrajectoryPoint  ros_JointTrajPt;
@@ -117,7 +121,7 @@ bool JointTrajectoryInterface::init(SmplMsgConnection* connection, const std::ve
       && !industrial_utils::param::getJointVelocityLimits("robot_description", joint_vel_limits_))
     ROS_WARN("Unable to read velocity limits from 'robot_description' param.  Velocity validation disabled.");
 
-
+  this->pub_motion_reply_ = this->node_.advertise<motoman_msgs::MotionReplyResult>("joint_path_motion_reply", 1);
   this->srv_stop_motion_ = this->node_.advertiseService(
                              "stop_motion", &JointTrajectoryInterface::stopMotionCB, this);
   this->srv_joint_trajectory_ = this->node_.advertiseService(
@@ -145,6 +149,7 @@ bool JointTrajectoryInterface::init(
         "robot_description", joint_vel_limits_))
     ROS_WARN("Unable to read velocity limits from 'robot_description' param.  Velocity validation disabled.");
 
+  this->pub_motion_reply_ = this->node_.advertise<motoman_msgs::MotionReplyResult>("joint_path_motion_reply", 1);
   // General server and subscriber for compounded trajectories
   this->srv_joint_trajectory_ = this->node_.advertiseService(
                                   "joint_path_command", &JointTrajectoryInterface::jointTrajectoryExCB, this);
@@ -160,10 +165,13 @@ bool JointTrajectoryInterface::init(
     name_str = iterator->second.get_name();
     ns_str = iterator->second.get_ns();
 
+    ros::Publisher pub_motion_reply;
     ros::ServiceServer srv_joint_trajectory;
     ros::ServiceServer srv_stop_motion;
     ros::Subscriber sub_joint_trajectory;
 
+    pub_motion_reply = this->node_.advertise<motoman_msgs::MotionReplyResult>(
+                         ns_str + "/" + name_str +"joint_path_motion_reply", 1);
     srv_stop_motion = this->node_.advertiseService(
                         ns_str + "/" + name_str + "/stop_motion",
                         &JointTrajectoryInterface::stopMotionCB, this);
@@ -173,7 +181,7 @@ bool JointTrajectoryInterface::init(
     sub_joint_trajectory = this->node_.subscribe(
                              ns_str + "/" + name_str + "/joint_path_command", 0,
                              &JointTrajectoryInterface::jointTrajectoryExCB, this);
-
+    this->pub_motion_replies_[robot_id] = pub_motion_reply;
     this->srv_stops_[robot_id] = srv_stop_motion;
     this->srv_joints_[robot_id] = srv_joint_trajectory;
     this->sub_joint_trajectories_[robot_id] = sub_joint_trajectory;
@@ -229,6 +237,7 @@ void JointTrajectoryInterface::jointTrajectoryExCB(
   const motoman_msgs::DynamicJointTrajectoryConstPtr &msg)
 {
   ROS_INFO("Receiving joint trajectory message Dynamic");
+  ROS_INFO("JointTrajectoryInterface::jointTrajectoryExCB");
 
   // check for STOP command
   if (msg->points.empty())
@@ -252,7 +261,6 @@ void JointTrajectoryInterface::jointTrajectoryCB(
   const trajectory_msgs::JointTrajectoryConstPtr &msg)
 {
   ROS_INFO("Receiving joint trajectory message");
-
   // check for STOP command
   if (msg->points.empty())
   {
@@ -263,11 +271,24 @@ void JointTrajectoryInterface::jointTrajectoryCB(
 
   // convert trajectory into robot-format
   std::vector<SimpleMessage> robot_msgs;
-  if (!trajectory_to_msgs(msg, &robot_msgs))
+  if (!trajectory_to_msgs(msg, &robot_msgs)){
+    // The trajectory is not valid, or failed to be converted into appropriate robot messages.
+    sendMotionReplyResult(pub_motion_reply_, MotionReplyResult::INVALID);
     return;
+  }
 
   // send command messages to robot
-  send_to_robot(robot_msgs);
+  if (!send_to_robot(robot_msgs))
+  {
+    // Send to robot will fail if the robot is not ready yet.
+    sendMotionReplyResult(pub_motion_reply_, MotionReplyResult::NOT_READY);
+    return;
+  }
+
+  // Successfully send the motion to the robot.
+  // It may still get aborted/interrupted while the motion is streaming,
+  // but the input trajectory should be executing now.
+  sendMotionReplyResult(pub_motion_reply_, MotionReplyResult::SUCCESS);
 }
 
 bool JointTrajectoryInterface::trajectory_to_msgs(
@@ -340,6 +361,31 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
     if (!select(traj->joint_names, traj->points[i],
                 this->all_joint_names_, &rbt_pt))
       return false;
+
+    // Check if the first trajectory point should be replaced with the current joint position.
+    if (i == 0 && replace_start_state_)
+    {
+      double startWait = ros::Time::now().toSec();
+
+      // Wait for the latest joint config to be within 5ms from now before replacing the start of the trajectory.
+      bool needWait = false;
+      double dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
+      while (dt > 0.005)
+      {
+        needWait = true;
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
+      }
+      rbt_pt.positions = cur_joint_pos_.position;
+      double stopWait = ros::Time::now().toSec();
+      if (needWait)
+      {
+        ROS_INFO("Waited %0.4f seconds for a fresh joint state.",(stopWait-startWait));
+      }
+
+      ROS_INFO("Replaced the initial joint position with the current joint configuration. "
+               "Joint state dt to now: %0.5f seconds.", dt);
+    }
 
     // transform point data (e.g. for joint-coupling)
     if (!transform(rbt_pt, &xform_pt))
@@ -734,6 +780,47 @@ void JointTrajectoryInterface::jointStateCB(
   const sensor_msgs::JointStateConstPtr &msg, int robot_id)
 {
   this->cur_joint_pos_map_[robot_id] = *msg;
+}
+
+void JointTrajectoryInterface::sendMotionReplyResult(ros::Publisher& pub, int res)
+{
+  motoman_msgs::MotionReplyResult msg;
+  // In theory, if res really coming from MotionReplyResult, msg.val can directly be assigned to res.
+  // This switch case is added to prevent unexpected results coming from:
+  // 1. Invalid cast or direct assignment of MotionReplyResult enum.
+  // 2. Modification to motoman::simple_message::motion_reply::MotionReplyResult or motoman_msgs::MotionReplyResult
+  //    value assignments that do not get propagated properly.
+  switch (res)
+  {
+    case MotionReplyResult::SUCCESS:
+      msg.val = motoman_msgs::MotionReplyResult::SUCCESS;
+      break;
+      break;
+    case MotionReplyResult::BUSY:
+      msg.val = motoman_msgs::MotionReplyResult::BUSY;
+      break;
+    case MotionReplyResult::FAILURE:
+      msg.val = motoman_msgs::MotionReplyResult::FAILURE;
+      break;
+    case MotionReplyResult::INVALID:
+      msg.val = motoman_msgs::MotionReplyResult::INVALID;
+      break;
+    case MotionReplyResult::ALARM:
+      msg.val = motoman_msgs::MotionReplyResult::ALARM;
+      break;
+    case MotionReplyResult::NOT_READY:
+      msg.val = motoman_msgs::MotionReplyResult::NOT_READY;
+      break;
+    case MotionReplyResult::MP_FAILURE:
+      msg.val = motoman_msgs::MotionReplyResult::MP_FAILURE;
+      break;
+    default:
+    {
+      ROS_ERROR("Skipped publishing invalid MotionReplyResult (%i).", res);
+      return;
+    }
+  }
+  pub.publish(msg);
 }
 
 }  // namespace joint_trajectory_interface
