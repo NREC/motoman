@@ -349,6 +349,7 @@ protected:
    *            values.
    */
   void sendMotionReplyResult(ros::Publisher& pub, int res);
+  std::mutex m_mtx;
 
   TcpClient default_tcp_connection_;
 
