@@ -348,6 +348,38 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
 {
   msgs->clear();
 
+  constexpr double STALE_TIME_THRESHOLD = 0.005;
+  // Make sure the current joint config is within STALE_TIME_THRESHOLD before validating the trajectory.
+  ros::Time startWait = ros::Time::now();
+  bool needWait = false;
+  double dt;
+  {
+    std::lock_guard<std::mutex> lock(m_mtx);
+    dt = (ros::Time::now()- cur_joint_pos_.header.stamp).toSec();
+  }
+  double initDt = dt;
+  while (dt > STALE_TIME_THRESHOLD)
+  {
+    needWait = true;
+    std::this_thread::sleep_for(std::chrono::microseconds(500));
+    std::lock_guard<std::mutex> lock(m_mtx);
+    dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
+  }
+
+  // Do not allow further update on joint state until the trajectory is published.
+  std::lock_guard<std::mutex> lock(m_mtx);
+  std::vector<double> startConfig = cur_joint_pos_.position;
+  ros::Time stopWait = ros::Time::now();
+  if (needWait)
+  {
+    ROS_DEBUG("Waited %0.4f seconds for a fresh joint state. "
+             "Joint state delta time reduced from: %0.5f -> %0.5f seconds.",
+             (stopWait-startWait).toSec(), initDt, dt);
+  } else
+  {
+    ROS_DEBUG("Joint state delta time: %0.5% seconds.", dt);
+  }
+
   // check for valid trajectory
   if (!is_valid(*traj))
     return false;
@@ -365,26 +397,8 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
     // Check if the first trajectory point should be replaced with the current joint position.
     if (i == 0 && replace_start_state_)
     {
-      double startWait = ros::Time::now().toSec();
-
-      // Wait for the latest joint config to be within 5ms from now before replacing the start of the trajectory.
-      bool needWait = false;
-      double dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
-      while (dt > 0.005)
-      {
-        needWait = true;
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
-        dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
-      }
-      rbt_pt.positions = cur_joint_pos_.position;
-      double stopWait = ros::Time::now().toSec();
-      if (needWait)
-      {
-        ROS_INFO("Waited %0.4f seconds for a fresh joint state.",(stopWait-startWait));
-      }
-
-      ROS_INFO("Replaced the initial joint position with the current joint configuration. "
-               "Joint state dt to now: %0.5f seconds.", dt);
+      rbt_pt.positions = std::move(startConfig);
+      ROS_INFO("Replaced the initial joint position with the current joint configuration.");
     }
 
     // transform point data (e.g. for joint-coupling)
@@ -773,6 +787,7 @@ bool JointTrajectoryInterface::is_valid(const motoman_msgs::DynamicJointTrajecto
 void JointTrajectoryInterface::jointStateCB(
   const sensor_msgs::JointStateConstPtr &msg)
 {
+  std::lock_guard<std::mutex> lock(m_mtx);
   this->cur_joint_pos_ = *msg;
 }
 
