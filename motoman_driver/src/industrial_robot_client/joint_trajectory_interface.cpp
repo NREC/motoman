@@ -350,6 +350,7 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
 
   constexpr double STALE_TIME_THRESHOLD = 0.005;
   // Make sure the current joint config is within STALE_TIME_THRESHOLD before validating the trajectory.
+  // Also make sure that the current joint config ~= previous joint config.
   ros::Time startWait = ros::Time::now();
   bool needWait = false;
   double dt;
@@ -358,31 +359,44 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
     dt = (ros::Time::now()- cur_joint_pos_.header.stamp).toSec();
   }
   double initDt = dt;
+  //bool noMotion = false;
   while (dt > STALE_TIME_THRESHOLD)
   {
     needWait = true;
     std::this_thread::sleep_for(std::chrono::microseconds(500));
     std::lock_guard<std::mutex> lock(m_mtx);
     dt = (ros::Time::now() - cur_joint_pos_.header.stamp).toSec();
+    /*
+    noMotion = true;
+    for (std::size_t idx = 0; idx < cur_joint_pos_.position.size(); ++idx)
+    {
+      if (std::fabs(cur_joint_pos_.position[idx] - prev_joint_pos_.position[idx]) > 1e-4)
+      {
+        noMotion = false;
+        break;
+      }
+    }
+    */
   }
 
-  // Do not allow further update on joint state until the trajectory is published.
-  std::lock_guard<std::mutex> lock(m_mtx);
-  std::vector<double> startConfig = cur_joint_pos_.position;
-  ros::Time stopWait = ros::Time::now();
-  if (needWait)
+  // Validate the trajectory.
   {
-    ROS_DEBUG("Waited %0.4f seconds for a fresh joint state. "
-             "Joint state delta time reduced from: %0.5f -> %0.5f seconds.",
-             (stopWait-startWait).toSec(), initDt, dt);
-  } else
-  {
-    ROS_DEBUG("Joint state delta time: %0.5% seconds.", dt);
-  }
+    std::lock_guard<std::mutex> lock(m_mtx);
+    ros::Time stopWait = ros::Time::now();
+    if (needWait)
+    {
+      ROS_DEBUG("Waited %0.4f seconds for a fresh joint state with no motion. "
+               "Joint state delta time reduced from: %0.5f -> %0.5f seconds.",
+               (stopWait-startWait).toSec(), initDt, dt);
+    } else
+    {
+      ROS_DEBUG("Joint state delta time: %0.5f seconds.", dt);
+    }
 
-  // check for valid trajectory
-  if (!is_valid(*traj))
-    return false;
+    // check for valid trajectory
+    if (!is_valid(*traj))
+      return false;
+  }
 
   for (size_t i = 0; i < traj->points.size(); ++i)
   {
@@ -397,7 +411,8 @@ bool JointTrajectoryInterface::trajectory_to_msgs(
     // Check if the first trajectory point should be replaced with the current joint position.
     if (i == 0 && replace_start_state_)
     {
-      rbt_pt.positions = std::move(startConfig);
+      std::lock_guard<std::mutex> lock(m_mtx);
+      rbt_pt.positions = cur_joint_pos_.position;
       ROS_INFO("Replaced the initial joint position with the current joint configuration.");
     }
 
@@ -788,6 +803,7 @@ void JointTrajectoryInterface::jointStateCB(
   const sensor_msgs::JointStateConstPtr &msg)
 {
   std::lock_guard<std::mutex> lock(m_mtx);
+  this->prev_joint_pos_ = *msg;
   this->cur_joint_pos_ = *msg;
 }
 

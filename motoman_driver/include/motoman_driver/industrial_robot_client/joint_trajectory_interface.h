@@ -377,6 +377,7 @@ protected:
   double default_vel_ratio_;  // default velocity ratio to use for joint commands, if no velocity or max_vel specified
   double default_duration_;   // default duration to use for joint commands, if no
   std::map<std::string, double> joint_vel_limits_;  // cache of max joint velocities from URDF
+  sensor_msgs::JointState prev_joint_pos_;  // cache of previous received joint state
   sensor_msgs::JointState cur_joint_pos_;  // cache of last received joint state
 
   std::map<int, sensor_msgs::JointState> cur_joint_pos_map_;
