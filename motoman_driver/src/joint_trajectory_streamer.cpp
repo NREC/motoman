@@ -551,7 +551,17 @@ void MotomanJointTrajectoryStreamer::streamingThread()
                            << MotomanMotionCtrl::getErrorString(reply_status.reply_));
           this->state_ = TransferStates::IDLE;
           // TODO Determine if the reply should be published into pub_motion_replies_ or pub_motion_reply_.
-          sendMotionReplyResult(pub_motion_reply_, reply_status.reply_.getResult());
+          namespace MotionReplySubcodes = motoman::simple_message::motion_reply::MotionReplySubcodes;
+          if (reply_status.reply_.getSubcode() == MotionReplySubcodes::Invalid::DATA_START_POS)
+          {
+            // May not be needed...
+            ROS_WARN("Detected start position failure. Instead of %i, motion reply will be returned with %i",
+                     reply_status.reply_.getResult(), MotionReplyResults::INVALID);
+            sendMotionReplyResult(pub_motion_reply_, MotionReplyResults::INVALID);
+          } else
+          {
+            sendMotionReplyResult(pub_motion_reply_, reply_status.reply_.getResult());
+          }
           break;
         }
       }
